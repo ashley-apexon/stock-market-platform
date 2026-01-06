@@ -1,5 +1,6 @@
 package com.market.marketsearchservice.service.impl;
 import com.market.marketsearchservice.dto.*;
+import com.market.marketsearchservice.entity.StockSymbol;
 import com.market.marketsearchservice.repository.StockSymbolRepository;
 import com.market.marketsearchservice.service.FinMarketSearchService;
 import com.market.marketsearchservice.service.TrieService;
@@ -131,6 +132,11 @@ public class FinMarketSearchServiceImpl implements FinMarketSearchService {
 
     public List<String> searchStock(String prefix) {
         return trieService.search(prefix);
+    }
+
+    public StockSymbol stockNameToSymbol(String name) {
+        // mostly used by internal applications where we know the stock name but dont know the stock symbol
+        return stockSymbolRepository.findByName(name);
     }
 
 
