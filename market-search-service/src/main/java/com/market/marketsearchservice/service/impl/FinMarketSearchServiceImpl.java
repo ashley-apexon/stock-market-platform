@@ -1,0 +1,143 @@
+package com.market.marketsearchservice.service.impl;
+import com.market.marketsearchservice.dto.*;
+import com.market.marketsearchservice.entity.StockSymbol;
+import com.market.marketsearchservice.repository.StockSymbolRepository;
+import com.market.marketsearchservice.service.FinMarketSearchService;
+import com.market.marketsearchservice.service.TrieService;
+import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
+import io.github.resilience4j.retry.annotation.Retry;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.web.reactive.function.client.WebClient;
+
+import java.time.Duration;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+
+@Service
+public class FinMarketSearchServiceImpl implements FinMarketSearchService {
+
+    private final WebClient webClient;
+    private final String apiKey;
+    private final RedisTemplate<String, Object> redisTemplate;
+    private final StockSymbolRepository stockSymbolRepository;
+    private final TrieService trieService;
+
+
+    public FinMarketSearchServiceImpl (WebClient.Builder builder,
+                                      @Value("${finnhub.api.key}") String apiKey,
+                                      RedisTemplate<String, Object> redisTemplate, StockSymbolRepository stockSymbolRepository, TrieService trieService) {
+        this.webClient = builder.baseUrl("https://finnhub.io/api/v1").build();
+        this.apiKey = apiKey;
+        this.redisTemplate = redisTemplate;
+        this.stockSymbolRepository = stockSymbolRepository;
+        this.trieService = trieService;
+    }
+
+    @CircuitBreaker(name = "finnhubSearch", fallbackMethod = "fallbackSearch")
+    @Retry(name = "finnhubSearch", fallbackMethod = "fallbackSearch")
+    public List<StockSearchDto> searchStocks(String query) {
+        String cacheKey = "search:" + query.toUpperCase();
+
+        // 1. Try cache first
+        StockSearchResultCache cached =
+                (StockSearchResultCache) redisTemplate.opsForValue().get(cacheKey);
+        if (cached != null && cached.getResults() != null) {
+            return cached.getResults();
+        }
+
+        // 2. Call Finnhub /search API
+        FinnhubSearchResponse searchResponse = webClient.get()
+                .uri(uriBuilder -> uriBuilder
+                        .path("/search")
+                        .queryParam("q", query)
+                        .queryParam("token", apiKey)
+                        .build())
+                .retrieve()
+                .bodyToMono(FinnhubSearchResponse.class)
+                .timeout(Duration.ofSeconds(3))
+                .block();
+
+        if (searchResponse == null || searchResponse.getResult() == null) {
+            return List.of();
+        }
+
+        // 3. Map search results (NO extra Finnhub calls)
+        List<StockSearchDto> results = searchResponse.getResult().stream()
+                .map(result -> {
+                    String exchange = detectExchange(result.getSymbol());
+                    Double score = result.getMatchScore();
+
+                    return new StockSearchDto(
+                            result.getSymbol(),
+                            result.getDescription(),
+                            result.getType(),
+                            exchange,                    // exchange / MIC
+                            "09:30",                     // default market open
+                            "16:00",                     // default market close
+                            "America/New_York",          // default timezone
+                            "USD",                       // default currency
+                            score != null ? score : 1.0  // safe score
+                    );
+                })
+                .toList();
+
+        // 4. Cache results (TTL = 5 minutes)
+        StockSearchResultCache cacheWrapper = new StockSearchResultCache();
+        cacheWrapper.setResults(results);
+        redisTemplate.opsForValue()
+                .set(cacheKey, cacheWrapper, 300, TimeUnit.SECONDS);
+
+        return results;
+    }
+
+    /**
+     * Fallback method for CircuitBreaker / Retry
+     */
+    public List<StockSearchDto> fallbackSearch(String query, Throwable t) {
+        String cacheKey = "search:" + query.toUpperCase();
+        StockSearchResultCache cached =
+                (StockSearchResultCache) redisTemplate.opsForValue().get(cacheKey);
+
+        if (cached != null && cached.getResults() != null) {
+            System.err.println("Finnhub unavailable, serving cached results for " + query);
+            return cached.getResults();
+        }
+
+        System.err.println("Finnhub unavailable, no cache found for " + query);
+        return List.of();
+    }
+
+    /**
+     * Detect exchange from symbol suffix
+     */
+    private String detectExchange(String symbol) {
+        if (symbol.endsWith(".TO")) return "TO";   // Toronto
+        if (symbol.endsWith(".MX")) return "MX";   // Mexico
+        if (symbol.endsWith(".VI")) return "VI";   // Vienna
+        if (symbol.endsWith(".WA")) return "WA";   // Warsaw
+        if (symbol.endsWith(".NE")) return "NE";   // Canada NEO
+        if (symbol.endsWith(".L")) return "L";    // London
+        if (symbol.endsWith(".AS")) return "AS";   // Amsterdam
+        if (symbol.endsWith(".RO")) return "RO";   // Bucharest
+        if (symbol.endsWith(".SN")) return "SN";   // Santiago
+        return "US"; // default
+    }
+
+
+    public List<StockSymbolDto> allStocks() {
+        return stockSymbolRepository.findAll().stream().map(StockSymbolDto::new).toList();
+    }
+
+    public List<String> searchStock(String prefix) {
+        return trieService.search(prefix);
+    }
+
+    public StockSymbol stockNameToSymbol(String name) {
+        // mostly used by internal applications where we know the stock name but dont know the stock symbol
+        return stockSymbolRepository.findByName(name);
+    }
+
+
+}
